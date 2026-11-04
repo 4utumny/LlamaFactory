@@ -21,3 +21,6 @@ xstest_judge_model: gpt-4o-mini
 api_base_url: https://api.chatanywhere.tech/v1
 api_timeout_seconds: 180
 api_max_tokens_parameter: max_tokens
+api_max_output_tokens:
+  sff: 256
+  xstest: 128
