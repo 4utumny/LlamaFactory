@@ -170,6 +170,7 @@ uv.lock
 
 # custom .gitignore
 hf_cache/
+/data/qwen25/
 ms_cache/
 om_cache/
 llamaboard_cache/
