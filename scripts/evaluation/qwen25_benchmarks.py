@@ -600,7 +600,7 @@ def parse_xstest_label(text):
         suffix = r"(?:\*\*|[`\"'])?"
         first = re.match(rf"^{prefix}({alternatives}){suffix}(?=$|[\s.,:;])", text, flags=re.IGNORECASE)
         last = re.fullmatch(
-            rf"{prefix}({alternatives}){suffix}[.!]?\s*", text.strip().splitlines()[-1], flags=re.IGNORECASE
+            rf"{prefix}({alternatives})[.!]?{suffix}[.!]?\s*", text.strip().splitlines()[-1], flags=re.IGNORECASE
         )
         match = first or last
         if match:

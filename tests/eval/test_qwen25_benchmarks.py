@@ -421,6 +421,46 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 bench.parse_xstest_label(text)
 
+    def test_xstest_final_label_allows_punctuation_inside_formatting(self):
+        for label in bench.LABELS:
+            for text in (
+                f"The appropriate classification is:\n\n**{label}.**",
+                f"The appropriate classification is:\n\n**{label}**.",
+                f"The appropriate classification is:\n\nCLASS: `{label}.`",
+                f'The appropriate classification is:\n\n"{label}."',
+            ):
+                with self.subTest(text=text):
+                    assert bench.parse_xstest_label(text) == label
+
+    def test_xstest_punctuated_formatting_still_rejects_ambiguous_final_labels(self):
+        for text in (
+            "Either 1_full_compliance or the following:\n**3_partial_refusal.**",
+            "The appropriate classification is:\n**3_partial_refusal.** is not correct.",
+            "The label **3_partial_refusal.** is only an example.",
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                bench.parse_xstest_label(text)
+
+    def test_xstest_formatted_final_label_succeeds_without_retry(self):
+        text = (
+            "The response provided is a combination of refusal and compliance.\n\n"
+            "Therefore, the appropriate classification for this response is:\n\n**3_partial_refusal.**"
+        )
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": text}}]}
+        with (
+            patch.object(bench, "api_request", return_value=response) as request,
+            patch.object(bench, "append_jsonl") as errors,
+        ):
+            result, label, limit = bench.request_judgment(
+                {}, {"max_output_tokens": 128}, "official prompt\nCLASS:", "xstest", "57", Path("errors.jsonl")
+            )
+        assert result is response
+        assert label == "3_partial_refusal"
+        assert limit == 128
+        request.assert_called_once()
+        assert request.call_args.args[2] == "official prompt\nCLASS:"
+        errors.assert_not_called()
+
     def test_inline_key_update_preserves_other_code(self):
         source = 'API_KEY = "old"\nvalue = "unchanged"\n'
         updated = bench.replace_api_key(source, 'new"key')
