@@ -120,6 +120,17 @@ def append_jsonl(path, value):
         f.flush()
 
 
+def write_jsonl(path, rows):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    temporary.replace(path)
+
+
 def load_config(args):
     import yaml
 
@@ -151,7 +162,10 @@ def load_rows(config, task):
     path = source_path(config, task)
     records = []
     if task == "sff":
-        for i, row in enumerate(read_jsonl(path)):
+        max_samples = config.get("sff_max_samples", 200)
+        if type(max_samples) is not int or max_samples < 1:
+            raise ValueError("sff_max_samples must be a positive integer.")
+        for i, row in enumerate(read_jsonl(path)[:max_samples]):
             if not all(isinstance(row.get(key), str) and row[key].strip() for key in ("post", "summary")):
                 raise ValueError(f"TL;DR row {i + 1} is missing its post or human-written summary.")
             post = f"SUBREDDIT: r/{row['subreddit']}\nTITLE: {row['title']}\nPOST: {row['post']}"
@@ -205,7 +219,7 @@ def checkpoint(config, stage, signature):
             previous = read_jsonl(path)
             if len({row["id"] for row in previous}) != len(previous):
                 raise ValueError(f"Duplicate IDs found in {path}.")
-            backup = out / f"{stage}.meta.before-retry-{previous_source}.json"
+            backup = out / f"{stage}.meta.before-source-{previous_source}.json"
             if backup.exists():
                 if json.loads(backup.read_text(encoding="utf-8")) != previous_metadata:
                     raise ValueError(f"The metadata backup already exists with different contents: {backup}")
@@ -213,7 +227,7 @@ def checkpoint(config, stage, signature):
                 write_json(backup, previous_metadata)
             write_json(meta_path, metadata)
             print(
-                f"Resuming {stage} after a verified retry-only update; kept {len(previous)} completed records.",
+                f"Resuming {stage} after a verified source update; kept {len(previous)} completed records.",
                 flush=True,
             )
     elif path.exists():
@@ -234,6 +248,19 @@ def model_identity(directory):
         "path": str(directory),
         "metadata_sha256": {name: file_sha(directory / name) for name in names if (directory / name).exists()},
         "weights": {p.name: [p.stat().st_size, p.stat().st_mtime_ns] for p in sorted(directory.glob("*.safetensors"))},
+    }
+
+
+def generation_signature(config, task, rows):
+    return {
+        "records_sha256": digest(rows),
+        "model": model_identity(config["model"]),
+        "system_prompt": config["system_prompt"],
+        "max_new_tokens": config["max_new_tokens"][task],
+        "context_limit": config["max_context_tokens"],
+        "batch_size": config["batch_size"],
+        "seed": config["seed"],
+        "versions": {name: importlib.metadata.version(name) for name in ("torch", "transformers")},
     }
 
 
@@ -394,16 +421,7 @@ def generate(config, args):
     model, tokenizer = None, None
     for task in tasks:
         rows = load_rows(config, task)
-        signature = {
-            "records_sha256": digest(rows),
-            "model": model_identity(config["model"]),
-            "system_prompt": config["system_prompt"],
-            "max_new_tokens": config["max_new_tokens"][task],
-            "context_limit": config["max_context_tokens"],
-            "batch_size": config["batch_size"],
-            "seed": config["seed"],
-            "versions": {n: importlib.metadata.version(n) for n in ("torch", "transformers")},
-        }
+        signature = generation_signature(config, task, rows)
         path, done = checkpoint(config, f"{task}.generations", signature)
         pending = [row for row in rows if row["id"] not in done]
         if pending and model is None:
@@ -696,6 +714,133 @@ def judge_strmatch(config):
             append_jsonl(path, {"id": row["id"], "label": classify(row["completion"])})
 
 
+def sff_trim_plan(config):
+    if config.get("limit", 0):
+        raise ValueError("Do not use --limit with trim-sff; it uses sff_max_samples from the configuration.")
+    out = Path(config["output_dir"])
+    generation_path = out / "sff.generations.jsonl"
+    generation_meta_path = out / "sff.generations.meta.json"
+    judgment_path = out / "sff.judgments.jsonl"
+    judgment_meta_path = out / "sff.judgments.meta.json"
+    if not generation_path.is_file() or not generation_meta_path.is_file():
+        raise ValueError("Existing SFF generations and their metadata are required.")
+    paths = [generation_path, generation_meta_path]
+    has_judgments = judgment_path.is_file() or judgment_meta_path.is_file()
+    if has_judgments:
+        if not judgment_path.is_file() or not judgment_meta_path.is_file():
+            raise ValueError("Both SFF judgment files must exist before trimming.")
+        paths.extend([judgment_path, judgment_meta_path])
+    snapshots = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in paths}
+    raw_rows = read_jsonl(source_path(config, "sff"))
+    full_config = {**config, "sff_max_samples": len(raw_rows), "limit": 0}
+    full_rows = load_rows(full_config, "sff")
+    selected_rows = load_rows({**config, "limit": 0}, "sff")
+    full_by_id = {row["id"]: row for row in full_rows}
+    generations_before = read_jsonl(generation_path)
+    generations_by_id = {row["id"]: row for row in generations_before}
+    if len(generations_by_id) != len(generations_before):
+        raise ValueError("Duplicate SFF generation IDs; no files were changed.")
+    for row in generations_before:
+        expected = full_by_id.get(row["id"])
+        if expected is None or any(row.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"SFF generation does not match the source dataset: {row['id']}")
+        if not row.get("completion", "").strip() or type(row.get("hit_token_limit")) is not bool:
+            raise ValueError(f"Incomplete SFF generation: {row['id']}")
+    if any(row["id"] not in generations_by_id for row in selected_rows):
+        raise ValueError("Some selected SFF questions have no saved generation; no files were changed.")
+    retained_generations = [generations_by_id[row["id"]] for row in selected_rows]
+    old_generation_meta = json.loads(generation_meta_path.read_text(encoding="utf-8"))
+    signature = generation_signature(config, "sff", selected_rows)
+    accepted_sources = {script_sha(), *config.get("resume_compatible_script_sha256", {})}
+    if old_generation_meta.get("script_sha256") not in accepted_sources:
+        raise ValueError("The SFF generation source version is not verified for this migration.")
+    if old_generation_meta.get("records_sha256") not in {digest(full_rows), digest(selected_rows)}:
+        raise ValueError("The original SFF generation input fingerprint does not match the dataset.")
+    if any(old_generation_meta.get(key) != value for key, value in signature.items() if key != "records_sha256"):
+        raise ValueError("Generation settings changed; trimming cannot reuse these completions.")
+    jsonl_updates = {generation_path: retained_generations}
+    meta_updates = {generation_meta_path: {"script_sha256": script_sha(), **signature}}
+    judgment_count = retained_count = None
+    if has_judgments:
+        judgments_before = read_jsonl(judgment_path)
+        judgments_by_id = {row["id"]: row for row in judgments_before}
+        if len(judgments_by_id) != len(judgments_before):
+            raise ValueError("Duplicate SFF judgment IDs; no files were changed.")
+        old_judgment_meta = json.loads(judgment_meta_path.read_text(encoding="utf-8"))
+        settings = api_settings(config, argparse.Namespace(judge_model=None), "sff")
+        expected_old = {
+            "input_sha256": digest(generations_before),
+            "api": settings,
+            "prompt_sha256": digest(SFF_JUDGE),
+            "seed": config["seed"],
+        }
+        if old_judgment_meta.get("script_sha256") not in accepted_sources or any(
+            old_judgment_meta.get(key) != value for key, value in expected_old.items()
+        ):
+            raise ValueError("SFF judgment metadata does not match the original inputs and current judge settings.")
+        for row in judgments_before:
+            slot = random.Random(f"{config['seed']}:{row['id']}").choice(("A", "B"))
+            label = parse_preference(row["raw"])
+            if row["id"] not in generations_by_id or row.get("model_slot") != slot or row.get("label") != label:
+                raise ValueError(f"SFF judgment has inconsistent ID or A/B mapping: {row['id']}")
+            if type(row.get("win")) is not bool or row["win"] != (label == slot):
+                raise ValueError(f"SFF judgment has an inconsistent win value: {row['id']}")
+        retained_judgments = [judgments_by_id[row["id"]] for row in selected_rows if row["id"] in judgments_by_id]
+        jsonl_updates[judgment_path] = retained_judgments
+        meta_updates[judgment_meta_path] = {
+            "script_sha256": script_sha(),
+            **expected_old,
+            "input_sha256": digest(retained_generations),
+        }
+        judgment_count, retained_count = len(judgments_before), len(retained_judgments)
+    return {
+        "jsonl_updates": jsonl_updates,
+        "meta_updates": meta_updates,
+        "snapshots": snapshots,
+        "summary": {
+            "selected_questions": len(selected_rows),
+            "first_id": selected_rows[0]["id"],
+            "last_id": selected_rows[-1]["id"],
+            "generations_before": len(generations_before),
+            "generations_after": len(retained_generations),
+            "judgments_before": judgment_count,
+            "judgments_after": retained_count,
+        },
+    }
+
+
+def trim_sff(config, args):
+    plan = sff_trim_plan(config)
+    print(json.dumps(plan["summary"], ensure_ascii=False, indent=2))
+    if not args.apply:
+        print("Dry run only. Re-run trim-sff --apply to back up and replace the SFF result files.")
+        return
+    for path, snapshot in plan["snapshots"].items():
+        if (path.stat().st_size, path.stat().st_mtime_ns) != snapshot:
+            raise ValueError("SFF files changed during validation; stop all evaluation processes before trimming.")
+    backup = Path(config["output_dir"]) / f"sff_before_subset_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+    backup.mkdir()
+    for path in plan["snapshots"]:
+        shutil.copy2(path, backup / path.name)
+    metrics = Path(config["output_dir"]) / "metrics.json"
+    if metrics.is_file():
+        shutil.copy2(metrics, backup / metrics.name)
+    for path, snapshot in plan["snapshots"].items():
+        if (path.stat().st_size, path.stat().st_mtime_ns) != snapshot:
+            raise ValueError(f"SFF files changed while backing up; no files were replaced. Backup: {backup}")
+    try:
+        for path, rows in plan["jsonl_updates"].items():
+            write_jsonl(path, rows)
+        for path, metadata in plan["meta_updates"].items():
+            write_json(path, metadata)
+    except BaseException:
+        for path in plan["snapshots"]:
+            shutil.copy2(backup / path.name, path)
+        raise
+    print(f"SFF results trimmed successfully. Original files are backed up in {backup}.")
+    print("Run report to refresh metrics.json. No models or judge APIs were called.")
+
+
 def metric_counts(expected_ids, judgments, positive):
     ids = [row["id"] for row in judgments]
     if len(ids) != len(set(ids)) or not set(ids).issubset(expected_ids):
@@ -743,7 +888,7 @@ def main():
         "--limit",
         type=int,
         default=0,
-        help="First N prompts per task; 0 means all. Use a separate output directory for smoke tests.",
+        help="First N selected prompts per task; 0 means all selected prompts. SFF respects sff_max_samples.",
     )
     parser.add_argument("--batch-size", type=int)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -753,6 +898,13 @@ def main():
     sub.add_parser("judge-harmbench")
     sub.add_parser("judge-strmatch")
     sub.add_parser("report")
+    sub.add_parser(
+        "trim-sff", help="Keep the configured SFF prefix and update metadata without rejudging."
+    ).add_argument(
+        "--apply",
+        action="store_true",
+        help="Back up and rewrite SFF result files; otherwise only validate and preview.",
+    )
     sub.add_parser("judge-sff").add_argument("--judge-model")
     sub.add_parser("judge-xstest").add_argument("--judge-model")
     check = sub.add_parser("api-check")
@@ -766,6 +918,8 @@ def main():
         prepare(config, args)
     elif args.command == "generate":
         generate(config, args)
+    elif args.command == "trim-sff":
+        trim_sff(config, args)
     elif args.command == "judge-harmbench":
         judge_harmbench(config)
     elif args.command == "judge-strmatch":

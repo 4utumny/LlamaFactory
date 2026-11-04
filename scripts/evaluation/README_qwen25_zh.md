@@ -69,7 +69,7 @@ python scripts/evaluation/qwen25_benchmarks.py api-check --task xstest
 
 ## 评估口径
 
-1. **Summarize from Feedback**：使用原发布方 `tldr_3_filtered/test.jsonl` 的原帖与人写 `summary`，不使用 comparisons 的 chosen 作为参考。已核实完整测试集有 6553 条，默认全部参与。帖子包含 subreddit/title 元信息；Qwen 使用通用 system prompt、chat template、贪心生成，最长 128 个新 token。裁判使用 DPO 附录 C.2 的 C 提示词，按固定种子逐题随机 A/B，计算 Qwen 胜率。API 裁判输出上限 256 token。原论文的 `gpt-4-0314` 已不可通过官方 API 使用，本实验明确采用用户选择的 `gpt-4o-mini`，因此报告时要说明裁判差异。
+1. **Summarize from Feedback**：使用原发布方 `tldr_3_filtered/test.jsonl` 的原帖与人写 `summary`，不使用 comparisons 的 chosen 作为参考。原始测试集有 6553 条；按用户要求，现在和后续默认只取文件顺序中的前 200 条，原始序号为 0–199，不随机抽样、不重新编号。YAML 的 `sff_max_samples: 200` 只限制 SFF；`--limit 5` 会进一步缩为前 5 条以便冒烟测试。帖子包含 subreddit/title 元信息；Qwen 使用通用 system prompt、chat template、贪心生成，最长 128 个新 token。裁判使用 DPO 附录 C.2 的 C 提示词，按固定种子逐题随机 A/B，计算 Qwen 胜率。API 裁判输出上限 256 token。原论文的 `gpt-4-0314` 已不可通过官方 API 使用，本实验明确采用用户选择的 `gpt-4o-mini`，因此报告时要说明裁判差异及前 200 条选样范围。
 2. **HarmBench**：显式选择 `text_all` 中全部 200 条 standard，每题直接请求一次，不使用越狱模板，指标名为 `harmbench_standard_direct_asr`。目标论文说明使用 200 条题目，但正文没有列出 ID，不能宣称本方案已核实与论文样本完全一致。版权题要走哈希流程，上下文题要保留 context，本入口不混用这些类别。分类器使用固定版本官方模板、回答前 512 个分类器 token、贪心输出 1 token；后端为 Transformers。
 3. **XSTest**：只使用 `type` 不以 `contrast_` 开头的 250 条安全题。字符串法保留为本地辅助基线；API 三分类使用 `gpt-4o-mini`，原样使用官方分类提示词，只替换 QUESTION 和 RESPONSE，保留末尾的 `CLASS:`，不追加任何指令。API 的通用 system 消息也与官方脚本一致。裁判初始输出上限为 128 token，可在 YAML 的 `api_max_output_tokens.xstest` 修改；这是对官方 16-token 参数的调整，应在实验记录中说明。分别报告完全拒绝率、完全或部分拒绝率。不把 200 条不安全对照题放入过度拒绝率分母。
 
@@ -123,7 +123,7 @@ python "$EVAL" --output-dir "$OUT" report
 cat "$OUT/metrics.json"
 ```
 
-全量摘要需要 6553 条 API 判定，XSTest 需要 250 条。脚本不自动更换模型；需要临时变更裁判时，显式传 `--judge-model` 并使用新输出目录。
+按当前选样方案，完整 SFF 评估需要 200 条 API 判定，XSTest 需要 250 条，共 450 条，重试另计。HarmBench 仍为 200 条本地分类判定。脚本不自动更换模型；需要临时变更裁判时，显式传 `--judge-model` 并使用新输出目录。
 
 ## 输出与续跑
 
@@ -141,7 +141,7 @@ cat "$OUT/metrics.json"
 
 ## 525 自动重试更新后的续跑
 
-本次只修改 HTTP 重试及其续跑兼容逻辑，生成、提示词、标签解析和计分逻辑保持不变。YAML 的 `resume_compatible_script_sha256` 固定记录经过验证的旧源码指纹到本次新指纹的映射。只有来源指纹成对匹配，且输入、模型、提示词等阶段签名全部一致时，程序才会自动续跑；其他源码或评估参数变化仍报错。
+525 更新只修改 HTTP 重试及其续跑兼容逻辑；后续的 SFF 前 200 条更新单独改变了 SFF 选样范围。YAML 的 `resume_compatible_script_sha256` 记录经过验证的旧源码指纹到当前源码的映射。只有来源指纹成对匹配，且输入、模型、提示词等阶段签名全部一致时，程序才会自动续跑；SFF 数据范围改变时必须先执行下节的 `trim-sff`，其他评估参数变化仍报错。
 
 首次续跑会保留旧 `.meta.json` 的备份，再更新来源指纹；不会删除、覆盖或重新判定已有 JSONL 记录。无须清空输出目录。停止旧进程后，由用户通过 GitHub 同步本次 Python、YAML 等改动，然后执行：
 
@@ -155,6 +155,35 @@ python -u scripts/evaluation/qwen25_benchmarks.py \
 ```
 
 保持使用原来的 API_KEY 和输出目录。重试只能等待中转恢复，不能修复服务方持续存在的源站 SSL 配置故障。
+
+## 将已有 SFF 结果裁剪为前 200 条
+
+先停止正在运行的评估进程，再通过 GitHub 同步本次代码和 YAML。只修改本地源码，由用户亲自执行服务器上的裁剪命令。
+
+原始 `data/qwen25/tldr_3_filtered/test.jsonl` 保留全部 6553 条，不修改官方文件及其 SHA256。只裁剪活动结果目录中的 `sff.generations.jsonl` 与 `sff.judgments.jsonl`，保留与原始测试题前 200 条 ID 对应的记录，并同步更新两个 `.meta.json` 的来源、输入指纹。其他任务结果不变。
+
+```bash
+cd /home/ubuntu/hmq/LlamaFactory
+source /home/ubuntu/hmq/qwen25_dpo_runtime/venv/bin/activate
+
+# Validate and preview; no files are changed.
+python scripts/evaluation/qwen25_benchmarks.py \
+    --output-dir outputs/evaluation/qwen25_baseline trim-sff
+
+# Back up the original result files, then keep only the selected SFF rows.
+python scripts/evaluation/qwen25_benchmarks.py \
+    --output-dir outputs/evaluation/qwen25_baseline trim-sff --apply
+
+# Refresh the denominator and scores using the retained records.
+python scripts/evaluation/qwen25_benchmarks.py \
+    --output-dir outputs/evaluation/qwen25_baseline report
+```
+
+`trim-sff` 会验证现有生成参数、数据 ID、参考摘要、裁判提示词、API 参数、A/B 位置和胜负映射。缺失生成、重复 ID 或参数不一致时会停止，不覆盖结果。`--apply` 前会复制原文件到自动命名的 `sff_before_subset_*` 目录；普通写入异常或中断会恢复备份。默认只预览，不修改文件。
+
+本次只读检查时，生成文件为 6553 条，判定文件为 550 条；前 200 条均已完成，最后一条为 `sff:199:t3_2oxvlx`。裁剪后无需重新生成或重新调用 SFF 裁判。若以后在尚未完成 200 条判定时裁剪，可以继续运行 `judge-sff` 补齐剩余判定。
+
+后续原有命令默认评估 SFF 前 200 条。不要用全局 `--limit 200` 代替这个设置，否则 XSTest 也会被缩为 200 条。HarmBench 仍为 200 条，XSTest 仍为 250 条。
 
 ## 恢复官方提示词后的运行步骤
 

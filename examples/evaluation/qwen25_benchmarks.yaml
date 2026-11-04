@@ -3,6 +3,8 @@ model: hf_cache/models/Qwen2.5-7B-Instruct
 classifier: hf_cache/models/HarmBench-Llama-2-13b-cls
 data_root: data/qwen25
 output_dir: outputs/evaluation/qwen25_baseline
+# Select the first 200 SFF test rows without shuffling; --limit can reduce smoke tests further.
+sff_max_samples: 200
 seed: 42
 batch_size: 4
 max_context_tokens: 8192
@@ -27,6 +29,7 @@ api_max_tokens_parameter: max_tokens
 api_max_output_tokens:
   sff: 256
   xstest: 128
-# Exact source pair verified for this retry-only update; other settings must match.
+# Exact source pairs verified for unchanged stage signatures. SFF scope changes require trim-sff.
 resume_compatible_script_sha256:
-  3771c415983ef4d91e6917ca0af13c82829d5d02cd14f278d2ccdd7c319ee420: cd3e447bda486e2794355fbd29782c09be24573b9df800341c5b4617dea299bf
+  3771c415983ef4d91e6917ca0af13c82829d5d02cd14f278d2ccdd7c319ee420: de06c649c3f0993f9cd929e710010e643c5e528092822442d77972c96542aa06
+  cd3e447bda486e2794355fbd29782c09be24573b9df800341c5b4617dea299bf: de06c649c3f0993f9cd929e710010e643c5e528092822442d77972c96542aa06

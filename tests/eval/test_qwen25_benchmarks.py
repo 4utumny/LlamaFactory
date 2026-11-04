@@ -165,7 +165,7 @@ class BenchmarkTests(unittest.TestCase):
         assert done["159"] == rows[-1]
         assert write.call_count == 2
         assert write.call_args_list[0].args[1] == previous
-        assert "before-retry" in write.call_args_list[0].args[0].name
+        assert "before-source" in write.call_args_list[0].args[0].name
         assert write.call_args_list[1].args[1] == {"script_sha256": "new-source", **signature}
         assert all(not entry.args[0].name.endswith(".jsonl") for entry in write.call_args_list)
 
@@ -197,6 +197,155 @@ class BenchmarkTests(unittest.TestCase):
         assert selected[0]["reference"] == "REFERENCE_SECRET"
         assert "REFERENCE_SECRET" not in selected[0]["prompt"]
         assert "post body" in selected[0]["prompt"]
+
+    def test_sff_defaults_to_first_200_and_smoke_limit_only_reduces_it(self):
+        rows = [
+            {"id": f"post{i}", "subreddit": "test", "title": "title", "post": "body", "summary": "reference"}
+            for i in range(220)
+        ]
+        for limit, expected in [(0, 200), (5, 5), (500, 200)]:
+            with self.subTest(limit=limit), patch.object(bench, "read_jsonl", return_value=rows):
+                selected = bench.load_rows({"data_root": ".", "harmbench_split": "all", "limit": limit}, "sff")
+            assert len(selected) == expected
+            assert selected[0]["id"] == "sff:0:post0"
+            assert selected[-1]["id"] == f"sff:{expected - 1}:post{expected - 1}"
+
+    def test_sff_sample_setting_is_positive_and_only_selected_rows_are_processed(self):
+        config = {"data_root": ".", "harmbench_split": "all", "limit": 0, "sff_max_samples": 1}
+        rows = [{"id": "post0", "subreddit": "test", "title": "title", "post": "body", "summary": "reference"}, {}]
+        with patch.object(bench, "read_jsonl", return_value=rows):
+            assert len(bench.load_rows(config, "sff")) == 1
+            for value in [0, -1, True, 1.5]:
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    bench.load_rows({**config, "sff_max_samples": value}, "sff")
+
+    def sff_migration_fixture(self):
+        raw = [
+            {"id": f"post{i}", "subreddit": "test", "title": "title", "post": "body", "summary": "reference"}
+            for i in range(220)
+        ]
+        config = {
+            "data_root": ".",
+            "output_dir": "unused-output",
+            "model": "unused-model",
+            "limit": 0,
+            "harmbench_split": "all",
+            "sff_max_samples": 200,
+            "seed": 42,
+            "batch_size": 4,
+            "max_context_tokens": 8192,
+            "max_new_tokens": {"sff": 128},
+            "system_prompt": "You are a helpful assistant.",
+            "sff_judge_model": "gpt-4o-mini",
+            "api_base_url": "https://api.chatanywhere.tech/v1",
+            "api_max_tokens_parameter": "max_tokens",
+            "resume_compatible_script_sha256": {"old-source": "new-source"},
+        }
+        with patch.object(bench, "read_jsonl", return_value=raw):
+            records = bench.load_rows({**config, "sff_max_samples": 220}, "sff")
+        # Reverse the saved order to verify selection uses IDs, not physical line numbers.
+        generations = [dict(row, completion="generated summary", hit_token_limit=False) for row in reversed(records)]
+        judgments = []
+        for row in generations:
+            slot = bench.random.Random(f"42:{row['id']}").choice(("A", "B"))
+            judgments.append(
+                {
+                    "id": row["id"],
+                    "model_slot": slot,
+                    "label": "A",
+                    "win": slot == "A",
+                    "raw": "Comparison: A is clearer.\nPreferred: A",
+                }
+            )
+        model = {"path": "unused-model"}
+        with (
+            patch.object(bench, "model_identity", return_value=model),
+            patch.object(bench.importlib.metadata, "version", return_value="test-version"),
+        ):
+            generation_meta = {"script_sha256": "old-source", **bench.generation_signature(config, "sff", records)}
+        judgment_meta = {
+            "script_sha256": "old-source",
+            "input_sha256": bench.digest(generations),
+            "api": bench.api_settings(config, SimpleNamespace(judge_model=None), "sff"),
+            "prompt_sha256": bench.digest(bench.SFF_JUDGE),
+            "seed": 42,
+        }
+
+        def read_jsonl(path):
+            return {"test.jsonl": raw, "sff.generations.jsonl": generations, "sff.judgments.jsonl": judgments}[
+                Path(path).name
+            ]
+
+        def read_text(path, **kwargs):
+            return json.dumps(
+                {"sff.generations.meta.json": generation_meta, "sff.judgments.meta.json": judgment_meta}[path.name]
+            )
+
+        return config, model, generation_meta, judgment_meta, read_jsonl, read_text
+
+    def test_sff_migration_keeps_original_first_200_and_updates_fingerprints(self):
+        config, model, _, _, read_jsonl, read_text = self.sff_migration_fixture()
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(Path, "stat", return_value=SimpleNamespace(st_size=100, st_mtime_ns=1)),
+            patch.object(Path, "read_text", read_text),
+            patch.object(bench, "read_jsonl", side_effect=read_jsonl),
+            patch.object(bench, "script_sha", return_value="new-source"),
+            patch.object(bench, "model_identity", return_value=model),
+            patch.object(bench.importlib.metadata, "version", return_value="test-version"),
+        ):
+            plan = bench.sff_trim_plan(config)
+        generated = plan["jsonl_updates"][Path("unused-output/sff.generations.jsonl")]
+        judgments = plan["jsonl_updates"][Path("unused-output/sff.judgments.jsonl")]
+        assert len(generated) == len(judgments) == 200
+        assert generated[0]["id"] == judgments[0]["id"] == "sff:0:post0"
+        assert generated[-1]["id"] == judgments[-1]["id"] == "sff:199:post199"
+        assert plan["summary"]["generations_before"] == plan["summary"]["judgments_before"] == 220
+        meta = plan["meta_updates"][Path("unused-output/sff.judgments.meta.json")]
+        assert meta["input_sha256"] == bench.digest(generated)
+        assert meta["script_sha256"] == "new-source"
+
+    def test_sff_migration_rejects_changed_judge_or_generation_settings(self):
+        config, model, generation_meta, judgment_meta, read_jsonl, read_text = self.sff_migration_fixture()
+        for metadata, key in [(generation_meta, "system_prompt"), (judgment_meta, "prompt_sha256")]:
+            previous = metadata[key]
+            metadata[key] = "changed"
+            with (
+                self.subTest(key=key),
+                patch.object(Path, "is_file", return_value=True),
+                patch.object(Path, "stat", return_value=SimpleNamespace(st_size=100, st_mtime_ns=1)),
+                patch.object(Path, "read_text", read_text),
+                patch.object(bench, "read_jsonl", side_effect=read_jsonl),
+                patch.object(bench, "script_sha", return_value="new-source"),
+                patch.object(bench, "model_identity", return_value=model),
+                patch.object(bench.importlib.metadata, "version", return_value="test-version"),
+            ):
+                with self.assertRaises(ValueError):
+                    bench.sff_trim_plan(config)
+            metadata[key] = previous
+
+    def test_sff_trim_is_dry_run_by_default_and_rolls_back_failed_writes(self):
+        paths = [Path("unused-output/sff.generations.jsonl"), Path("unused-output/sff.generations.meta.json")]
+        plan = {
+            "summary": {"generations_after": 200},
+            "snapshots": dict.fromkeys(paths, (100, 1)),
+            "jsonl_updates": {paths[0]: [{"id": "sff:0:post0"}]},
+            "meta_updates": {paths[1]: {"script_sha256": "new"}},
+        }
+        with patch.object(bench, "sff_trim_plan", return_value=plan), patch.object(bench, "write_jsonl") as write:
+            bench.trim_sff({"output_dir": "unused-output"}, SimpleNamespace(apply=False))
+            write.assert_not_called()
+        with (
+            patch.object(bench, "sff_trim_plan", return_value=plan),
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "stat", return_value=SimpleNamespace(st_size=100, st_mtime_ns=1)),
+            patch.object(Path, "is_file", return_value=False),
+            patch.object(bench.shutil, "copy2") as copy,
+            patch.object(bench, "write_jsonl", side_effect=OSError("test write failure")),
+        ):
+            with self.assertRaises(OSError):
+                bench.trim_sff({"output_dir": "unused-output"}, SimpleNamespace(apply=True))
+        assert copy.call_count == 4
 
     def test_harmbench_selects_standard_only(self):
         rows = [{"BehaviorID": str(i), "Behavior": "request", "FunctionalCategory": "standard"} for i in range(200)]
