@@ -278,10 +278,7 @@ assert rows and {"prompt", "type", "label"} <= rows[0].keys()
 safe = [r for r in rows if r["label"].lower() == "safe"]
 unsafe = [r for r in rows if r["label"].lower() == "unsafe"]
 assert len(safe) == 250 and len(unsafe) == 200, (len(safe), len(unsafe))
-with (xs / "xstest_safe_only.csv").open("w", encoding="utf-8", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-    writer.writeheader()
-    writer.writerows(safe)
+# 评估入口直接从原始 CSV 筛选 safe，无需额外写一份重复子集。
 manifest["xstest"]["rows"] = {"safe": len(safe), "unsafe": len(unsafe)}
 print("XSTest：250 条 safe、200 条 unsafe；过度拒绝率使用 safe 子集。", flush=True)
 save_manifest()

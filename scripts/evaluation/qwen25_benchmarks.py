@@ -17,6 +17,7 @@
 import argparse
 import ast
 import csv
+import getpass
 import hashlib
 import importlib.metadata
 import json
@@ -24,12 +25,14 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
-from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# 直接在此填写 ChatAnywhere 密钥，或运行本脚本的 configure-api-key 子命令。
+API_KEY = ""
 HB_REVISION = "8e1604d1171fe8a48d8febecd22f600e462bdcdd"
 CLS_REVISION = "bda705349d1144fa618770bea64d99ce54e3835b"
 TLDR_URL = "https://openaipublic.blob.core.windows.net/summarize-from-feedback/datasets/tldr_3_filtered/test.jsonl"
@@ -61,6 +64,39 @@ def file_sha(path):
         for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def replace_api_key(source, key):
+    lines = source.splitlines(keepends=True)
+    assignments = [
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "API_KEY" for t in node.targets)
+    ]
+    if len(assignments) != 1:
+        raise ValueError("评估脚本必须有且仅有一处 API_KEY 常量赋值。")
+    node = assignments[0]
+    lines[node.lineno - 1 : node.end_lineno] = [f"API_KEY = {json.dumps(key)}\n"]
+    return "".join(lines)
+
+
+def script_sha():
+    # 密钥轮换不改变评估代码指纹，也不会把密钥写入结果元数据。
+    source = replace_api_key(Path(__file__).read_text(encoding="utf-8"), "")
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def configure_api_key():
+    if not sys.stdin.isatty():
+        raise RuntimeError("请在服务器交互终端运行 configure-api-key，以隐藏输入密钥。")
+    key = getpass.getpass("ChatAnywhere API_KEY（隐藏输入，写入本 Python 文件）: ").strip()
+    if not key or any(c.isspace() for c in key):
+        raise ValueError("密钥不能为空或包含空白字符。")
+    path = Path(__file__).resolve()
+    updated = replace_api_key(path.read_text(encoding="utf-8"), key)
+    compile(updated, str(path), "exec")
+    path.write_text(updated, encoding="utf-8")
+    print(f"密钥已写入 {path} 的 API_KEY 常量；后续评估自动读取。")
 
 
 def read_jsonl(path):
@@ -154,7 +190,7 @@ def checkpoint(config, stage, signature):
     out.mkdir(parents=True, exist_ok=True)
     meta_path = out / f"{stage}.meta.json"
     path = out / f"{stage}.jsonl"
-    metadata = {"script_sha256": file_sha(__file__), **signature}
+    metadata = {"script_sha256": script_sha(), **signature}
     if meta_path.exists():
         if json.loads(meta_path.read_text(encoding="utf-8")) != metadata:
             raise ValueError(f"{stage} 参数、源码或输入发生变化；请使用新的 --output-dir。")
@@ -437,13 +473,11 @@ def api_settings(config, args, task):
 def api_request(config, settings, prompt=None):
     import requests
 
-    key = os.environ.get("OPENAI_API_KEY")
+    key = API_KEY.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
-        raise ValueError("请在当前终端设置 OPENAI_API_KEY；不要写入 Git。")
+        raise ValueError("请先运行 configure-api-key，或填写本文件顶部的 API_KEY 常量。")
     headers = {"Authorization": f"Bearer {key}"}
-    url = settings["base_url"] + (
-        "/chat/completions" if prompt is not None else "/models/" + quote(settings["model"], safe="")
-    )
+    url = settings["base_url"] + ("/chat/completions" if prompt is not None else "/models")
     payload = {
         "model": settings["model"],
         "messages": [
@@ -466,7 +500,16 @@ def api_request(config, settings, prompt=None):
                 time.sleep(2 ** (attempt + 1))
                 continue
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if prompt is None:
+                models = result.get("data")
+                if not isinstance(models, list):
+                    raise ValueError("中转 /models 返回格式不符合预期。")
+                match = next((model for model in models if model.get("id") == settings["model"]), None)
+                if match is None:
+                    raise ValueError(f"中转模型列表中没有 {settings['model']}；未自动更换模型。")
+                return match
+            return result
         except (requests.ConnectionError, requests.Timeout):
             if attempt == 3:
                 raise
@@ -601,6 +644,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="每项前 N 题；0 表示全部。冒烟测试请另设输出目录。")
     parser.add_argument("--batch-size", type=int)
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("configure-api-key", help="隐藏输入 API_KEY，并直接保存到本 Python 文件。")
     sub.add_parser("prepare").add_argument("--skip-classifier", action="store_true")
     sub.add_parser("generate").add_argument("--task", choices=("all", "sff", "harmbench", "xstest"), default="all")
     sub.add_parser("judge-harmbench")
@@ -613,7 +657,9 @@ def main():
     check.add_argument("--judge-model")
     args = parser.parse_args()
     config = load_config(args)
-    if args.command == "prepare":
+    if args.command == "configure-api-key":
+        configure_api_key()
+    elif args.command == "prepare":
         prepare(config, args)
     elif args.command == "generate":
         generate(config, args)

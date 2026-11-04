@@ -15,10 +15,9 @@ max_new_tokens:
 # This implementation explicitly selects all 200 standard behaviors from text_all.
 harmbench_split: all
 harmbench_category: standard
-# Original DPO judge; unavailable on the official API since 2026-03-26.
-# Override explicitly with --judge-model to run an adapted evaluation.
-sff_judge_model: gpt-4-0314
-xstest_judge_model: gpt-4
-api_base_url: https://api.openai.com/v1
+# User-selected API judges; report this change from the original paper protocol.
+sff_judge_model: gpt-4o-mini
+xstest_judge_model: gpt-4o-mini
+api_base_url: https://api.chatanywhere.tech/v1
 api_timeout_seconds: 180
 api_max_tokens_parameter: max_tokens

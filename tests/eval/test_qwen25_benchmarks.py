@@ -17,6 +17,7 @@ import importlib.util
 import io
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -99,6 +100,79 @@ class BenchmarkTests(unittest.TestCase):
         assert bench.parse_xstest_label("3_partial_refusal") == "3_partial_refusal"
         with self.assertRaises(ValueError):
             bench.parse_xstest_label("maybe compliance")
+
+    def test_inline_key_update_preserves_other_code(self):
+        source = 'API_KEY = "old"\nvalue = "unchanged"\n'
+        updated = bench.replace_api_key(source, 'new"key')
+        values = {}
+        exec(updated, values)
+        assert values["API_KEY"] == 'new"key'
+        assert values["value"] == "unchanged"
+        assert bench.replace_api_key(source, "") == bench.replace_api_key(updated, "")
+        with self.assertRaises(ValueError):
+            bench.replace_api_key('API_KEY = "a"\nAPI_KEY = "b"\n', "new")
+
+    def test_configure_key_writes_python_constant_after_hidden_input(self):
+        with (
+            patch.object(bench.sys.stdin, "isatty", return_value=True),
+            patch.object(bench.getpass, "getpass", return_value="unit-test-only-secret"),
+            patch.object(Path, "read_text", return_value='API_KEY = ""\n'),
+            patch.object(Path, "write_text") as write,
+            patch("builtins.print") as output,
+        ):
+            bench.configure_api_key()
+        assert 'API_KEY = "unit-test-only-secret"' in write.call_args.args[0]
+        assert "unit-test-only-secret" not in str(output.call_args_list)
+
+    def test_api_settings_use_user_selected_judge_for_both_tasks(self):
+        config = {
+            "sff_judge_model": "gpt-4o-mini",
+            "xstest_judge_model": "gpt-4o-mini",
+            "api_base_url": "https://api.chatanywhere.tech/v1",
+            "api_max_tokens_parameter": "max_tokens",
+        }
+        with patch.dict(bench.os.environ, {}, clear=True):
+            for task, limit in [("sff", 256), ("xstest", 16)]:
+                settings = bench.api_settings(config, SimpleNamespace(judge_model=None), task)
+                assert settings["model"] == "gpt-4o-mini"
+                assert settings["base_url"] == "https://api.chatanywhere.tech/v1"
+                assert settings["max_output_tokens"] == limit
+
+    def test_api_uses_inline_key_and_checks_models_list(self):
+        settings = {
+            "model": "gpt-4o-mini",
+            "base_url": "https://api.chatanywhere.tech/v1",
+            "max_tokens_parameter": "max_tokens",
+            "max_output_tokens": 256,
+        }
+        with patch.object(bench, "API_KEY", "unit-test-inline-key"), patch("requests.request") as request:
+            request.return_value.status_code = 200
+            request.return_value.json.return_value = {"data": [{"id": "gpt-4o-mini"}]}
+            result = bench.api_request({"api_timeout_seconds": 180}, settings)
+            assert result["id"] == "gpt-4o-mini"
+            assert request.call_args.args == ("GET", "https://api.chatanywhere.tech/v1/models")
+            assert request.call_args.kwargs["headers"]["Authorization"] == "Bearer unit-test-inline-key"
+            request.return_value.json.return_value = {"data": [{"id": "another-model"}]}
+            with self.assertRaises(ValueError):
+                bench.api_request({"api_timeout_seconds": 180}, settings)
+
+    def test_chat_request_uses_selected_model_and_never_puts_key_in_payload(self):
+        settings = {
+            "model": "gpt-4o-mini",
+            "base_url": "https://api.chatanywhere.tech/v1",
+            "max_tokens_parameter": "max_tokens",
+            "max_output_tokens": 16,
+        }
+        with patch.object(bench, "API_KEY", "unit-test-inline-key"), patch("requests.request") as request:
+            request.return_value.status_code = 200
+            request.return_value.json.return_value = {"choices": []}
+            bench.api_request({"api_timeout_seconds": 180}, settings, "test prompt")
+            assert request.call_args.args == ("POST", "https://api.chatanywhere.tech/v1/chat/completions")
+            payload = request.call_args.kwargs["json"]
+            assert payload["model"] == "gpt-4o-mini"
+            assert payload["temperature"] == 0
+            assert payload["max_tokens"] == 16
+            assert "unit-test-inline-key" not in str(payload)
 
 
 if __name__ == "__main__":
