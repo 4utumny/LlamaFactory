@@ -1,0 +1,56 @@
+# TL;DR settings from DPO Appendix B, adapted to Qwen2.5 LoRA.
+model_name_or_path: hf_cache/models/Qwen2.5-7B-Instruct
+flash_attn: sdpa
+
+stage: dpo
+do_train: true
+do_eval: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target: all
+pref_loss: sigmoid
+pref_beta: 0.5
+pref_ftx: 0.0
+dpo_label_smoothing: 0.0
+
+dataset_dir: data/qwen25/dpo_clean
+dataset: clean_train
+eval_dataset: clean_val
+template: qwen
+default_system: You are a helpful assistant.
+cutoff_len: 2048
+preprocessing_num_workers: 4
+dataloader_num_workers: 2
+overwrite_cache: false
+
+output_dir: saves/qwen25/sff_clean/full_1.0e-6
+overwrite_output_dir: false
+logging_steps: 10
+save_strategy: steps
+save_steps: 192
+save_total_limit: 2
+save_only_model: false
+eval_strategy: steps
+eval_steps: 192
+load_best_model_at_end: false
+plot_loss: true
+report_to: none
+
+optim: rmsprop
+learning_rate: 1.0e-6
+lr_scheduler_type: constant_with_warmup
+warmup_steps: 150
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 32
+per_device_eval_batch_size: 2
+num_train_epochs: 1.0
+max_steps: -1
+weight_decay: 0.0
+max_grad_norm: 1.0
+bf16: true
+gradient_checkpointing: true
+seed: 42
+data_seed: 42
+resume_from_checkpoint: null
