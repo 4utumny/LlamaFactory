@@ -101,6 +101,25 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.parse_xstest_label("maybe compliance")
 
+    def test_xstest_can_read_explicit_labels_without_changing_the_prompt(self):
+        for text, expected in [
+            ("1_full_compliance. The response directly answers the question.", "1_full_compliance"),
+            ("The response answers the question.\nCLASS: 1_full_compliance", "1_full_compliance"),
+            ("The response refuses to answer.\n**2_full_refusal**", "2_full_refusal"),
+            ('"3_partial_refusal"', "3_partial_refusal"),
+        ]:
+            with self.subTest(text=text):
+                assert bench.parse_xstest_label(text) == expected
+
+    def test_xstest_rejects_ambiguous_or_incidental_label_mentions(self):
+        for text in [
+            "", "This is not 2_full_refusal.",
+            "1_full_compliance or 3_partial_refusal",
+            "The alternatives are 1_full_compliance and 2_full_refusal.\nCLASS: 1_full_compliance",
+        ]:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                bench.parse_xstest_label(text)
+
     def test_inline_key_update_preserves_other_code(self):
         source = 'API_KEY = "old"\nvalue = "unchanged"\n'
         updated = bench.replace_api_key(source, 'new"key')
@@ -191,7 +210,7 @@ class BenchmarkTests(unittest.TestCase):
         assert limits == [128, 256, 512]
         assert errors.call_count == 3
 
-    def test_xstest_request_adds_label_only_instruction(self):
+    def test_xstest_request_preserves_official_prompt_exactly(self):
         rows = [{"id": "3", "prompt": "test question", "completion": "test response"}]
         response = {
             "model": "gpt-4o-mini",
@@ -199,19 +218,20 @@ class BenchmarkTests(unittest.TestCase):
                 {"finish_reason": "stop", "message": {"content": "1_full_compliance"}},
             ],
         }
-        prompt = compile('"Original taxonomy. " + QUESTION + " " + RESPONSE', "<test>", "eval")
+        prompt = compile('"Original taxonomy. " + QUESTION + " " + RESPONSE + "\\nCLASS:"', "<test>", "eval")
         with (
             patch.object(bench, "generations", return_value=rows),
             patch.object(bench, "api_settings", return_value={"model": "gpt-4o-mini", "max_output_tokens": 128}),
             patch.object(bench, "official_xstest_prompt", return_value=(prompt, "official-hash")),
-            patch.object(bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {})),
+            patch.object(bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {})) as checkpoint,
             patch.object(bench, "request_judgment", return_value=(response, "1_full_compliance", 128)) as request,
             patch.object(bench, "append_jsonl") as append,
         ):
             bench.judge_api({"seed": 42}, SimpleNamespace(judge_model=None), "xstest")
         sent_prompt = request.call_args.args[2]
-        assert sent_prompt.startswith("Original taxonomy. test question test response")
-        assert sent_prompt.endswith(bench.XSTEST_OUTPUT_INSTRUCTION)
+        assert sent_prompt == "Original taxonomy. test question test response\nCLASS:"
+        assert sent_prompt.endswith("CLASS:")
+        assert checkpoint.call_args.args[2]["prompt_sha256"] == "official-hash"
         assert append.call_args.args[1]["finish_reason"] == "stop"
         assert append.call_args.args[1]["max_output_tokens"] == 128
 

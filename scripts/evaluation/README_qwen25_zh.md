@@ -71,7 +71,7 @@ python scripts/evaluation/qwen25_benchmarks.py api-check --task xstest
 
 1. **Summarize from Feedback**：使用原发布方 `tldr_3_filtered/test.jsonl` 的原帖与人写 `summary`，不使用 comparisons 的 chosen 作为参考。已核实完整测试集有 6553 条，默认全部参与。帖子包含 subreddit/title 元信息；Qwen 使用通用 system prompt、chat template、贪心生成，最长 128 个新 token。裁判使用 DPO 附录 C.2 的 C 提示词，按固定种子逐题随机 A/B，计算 Qwen 胜率。API 裁判输出上限 256 token。原论文的 `gpt-4-0314` 已不可通过官方 API 使用，本实验明确采用用户选择的 `gpt-4o-mini`，因此报告时要说明裁判差异。
 2. **HarmBench**：显式选择 `text_all` 中全部 200 条 standard，每题直接请求一次，不使用越狱模板，指标名为 `harmbench_standard_direct_asr`。目标论文说明使用 200 条题目，但正文没有列出 ID，不能宣称本方案已核实与论文样本完全一致。版权题要走哈希流程，上下文题要保留 context，本入口不混用这些类别。分类器使用固定版本官方模板、回答前 512 个分类器 token、贪心输出 1 token；后端为 Transformers。
-3. **XSTest**：只使用 `type` 不以 `contrast_` 开头的 250 条安全题。字符串法保留为本地辅助基线；API 三分类使用 `gpt-4o-mini`，保留原版三类定义，追加英文的“只输出一个标签、不解释”要求。裁判初始输出上限改为 128 token，可在 YAML 的 `api_max_output_tokens.xstest` 修改。分别报告完全拒绝率、完全或部分拒绝率。不把 200 条不安全对照题放入过度拒绝率分母。
+3. **XSTest**：只使用 `type` 不以 `contrast_` 开头的 250 条安全题。字符串法保留为本地辅助基线；API 三分类使用 `gpt-4o-mini`，原样使用官方分类提示词，只替换 QUESTION 和 RESPONSE，保留末尾的 `CLASS:`，不追加任何指令。API 的通用 system 消息也与官方脚本一致。裁判初始输出上限为 128 token，可在 YAML 的 `api_max_output_tokens.xstest` 修改；这是对官方 16-token 参数的调整，应在实验记录中说明。分别报告完全拒绝率、完全或部分拒绝率。不把 200 条不安全对照题放入过度拒绝率分母。
 
 HarmBench/XSTest 的 Qwen 回答最长 512 token。三个任务使用 BF16、无量化、batch size 4、贪心生成。超出上下文预算会报错，不静默截断原帖。异常分类输出不会被当作安全。
 
@@ -128,6 +128,7 @@ cat "$OUT/metrics.json"
 ## 输出与续跑
 
 - API 返回 `finish_reason=length` 时，不采纳截断结果，并在有限重试内将该题输出预算翻倍，最多尝试三次；`content_filter` 或明确拒绝立即报错，不反复重试，也不计入任何分类。每次失败记录结束原因、请求上限和原始响应，成功记录实际使用上限。
+- 裁判返回解释时，只接受开头或最后一行的明确分类标签，保留完整原始文本；出现多个类别或仅在解释中提及标签则报错，不猜测类别。这只影响返回值解析，不改变发送给裁判的官方提示词。
 - `*.generations.jsonl` 保存原题、生成和是否触及长度上限。参考摘要不会进入 Qwen 生成提示词。
 - `*.judgments.jsonl`、`xstest.strmatch.jsonl`、`xstest.gpt.jsonl` 保存逐题判定及 API 模型信息、用量。
 - `*.meta.json` 保存输入、模板、模型和不含密钥的源码指纹。
@@ -136,19 +137,25 @@ cat "$OUT/metrics.json"
 
 同一配置和输出目录可重复原命令续跑。更改模型、生成参数、数据或裁判版本时使用新输出目录。API_KEY 修改不触发源码指纹变化。JSONL 如出现损坏行会报错，不自动丢弃记录。
 
-## 旧版 16-token 截断的恢复步骤
+## 恢复官方提示词后的运行步骤
 
-旧版上限是 16 token，`gpt-4o-mini` 有时先解释再给标签，导致截断。同步本次修复后，因输出要求、预算及源码指纹均变化，应重新判定全部 5 条 XSTest；原 Qwen 回答和其他任务结果无需重新生成。
+旧版 16-token 上限造成截断；中间版本追加了输出指令，本次已移除并恢复官方提示词。同步本次修复后，应重新判定全部 5 条 XSTest，不混用旧提示词的标签；原 Qwen 回答和其他任务结果无需重新生成。输出预算仍为 128，发生截断时最多增加到 256、512，提示词保持不变。
 
 先确认 GitHub 同步后仍保留你的 API_KEY，再在服务器执行以下命令。只备份旧 XSTest GPT 判定与元数据，不移动生成记录或其他任务结果：
 
 ```bash
 cd /home/ubuntu/hmq/LlamaFactory
+source /home/ubuntu/hmq/qwen25_dpo_runtime/venv/bin/activate
 export EVAL=scripts/evaluation/qwen25_benchmarks.py
 export SMOKE=outputs/evaluation/qwen25_smoke
-export BACKUP="$SMOKE/xstest_before_fix_$(date +%Y%m%d_%H%M%S)"
+export BACKUP="$SMOKE/xstest_before_official_prompt_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP"
-mv -- "$SMOKE/xstest.gpt.jsonl" "$SMOKE/xstest.gpt.meta.json" "$BACKUP/"
+for file in xstest.gpt.jsonl xstest.gpt.meta.json; do
+    if [ -f "$SMOKE/$file" ]; then
+        mv -- "$SMOKE/$file" "$BACKUP/"
+    fi
+done
+python tests/eval/test_qwen25_benchmarks.py
 python -u "$EVAL" --output-dir "$SMOKE" --limit 5 judge-xstest
 python "$EVAL" --output-dir "$SMOKE" --limit 5 report
 ```
