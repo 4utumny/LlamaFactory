@@ -132,11 +132,88 @@ class BenchmarkTests(unittest.TestCase):
             "api_max_tokens_parameter": "max_tokens",
         }
         with patch.dict(bench.os.environ, {}, clear=True):
-            for task, limit in [("sff", 256), ("xstest", 16)]:
+            for task, limit in [("sff", 256), ("xstest", 128)]:
                 settings = bench.api_settings(config, SimpleNamespace(judge_model=None), task)
                 assert settings["model"] == "gpt-4o-mini"
                 assert settings["base_url"] == "https://api.chatanywhere.tech/v1"
                 assert settings["max_output_tokens"] == limit
+
+    def test_api_output_limit_can_be_configured(self):
+        config = {
+            "xstest_judge_model": "gpt-4o-mini",
+            "api_base_url": "https://api.chatanywhere.tech/v1",
+            "api_max_tokens_parameter": "max_tokens",
+            "api_max_output_tokens": {"xstest": 256},
+        }
+        with patch.dict(bench.os.environ, {}, clear=True):
+            settings = bench.api_settings(config, SimpleNamespace(judge_model=None), "xstest")
+        assert settings["max_output_tokens"] == 256
+
+    def test_truncation_retry_increases_budget_and_does_not_accept_partial_text(self):
+        responses = [
+            {"choices": [{"finish_reason": "length", "message": {"content": "1_full_compliance"}}]},
+            {"choices": [{"finish_reason": "stop", "message": {"content": "2_full_refusal"}}]},
+        ]
+        calls = []
+
+        def request(config, settings, prompt):
+            calls.append(dict(settings))
+            return responses.pop(0)
+
+        settings = {"max_output_tokens": 128}
+        with patch.object(bench, "api_request", side_effect=request), patch.object(bench, "append_jsonl") as errors:
+            _, label, limit = bench.request_judgment({}, settings, "prompt", "xstest", "3", Path("errors.jsonl"))
+        assert label == "2_full_refusal"
+        assert limit == 256
+        assert [call["max_output_tokens"] for call in calls] == [128, 256]
+        assert settings["max_output_tokens"] == 128
+        assert errors.call_count == 1
+        assert errors.call_args.args[1]["finish_reason"] == "length"
+
+    def test_filtering_stops_without_repeating_requests(self):
+        response = {"choices": [{"finish_reason": "content_filter", "message": {"content": None}}]}
+        with patch.object(bench, "api_request", return_value=response) as request, patch.object(bench, "append_jsonl"):
+            with self.assertRaisesRegex(ValueError, "filtered"):
+                bench.request_judgment({}, {"max_output_tokens": 128}, "prompt", "xstest", "3", Path("errors.jsonl"))
+        assert request.call_count == 1
+
+    def test_repeated_truncation_stops_after_three_attempts(self):
+        response = {"choices": [{"finish_reason": "length", "message": {"content": "explanation"}}]}
+        limits = []
+
+        def request(config, settings, prompt):
+            limits.append(settings["max_output_tokens"])
+            return response
+
+        with patch.object(bench, "api_request", side_effect=request), patch.object(bench, "append_jsonl") as errors:
+            with self.assertRaisesRegex(ValueError, "finish_reason='length'"):
+                bench.request_judgment({}, {"max_output_tokens": 128}, "prompt", "xstest", "3", Path("errors.jsonl"))
+        assert limits == [128, 256, 512]
+        assert errors.call_count == 3
+
+    def test_xstest_request_adds_label_only_instruction(self):
+        rows = [{"id": "3", "prompt": "test question", "completion": "test response"}]
+        response = {
+            "model": "gpt-4o-mini",
+            "choices": [
+                {"finish_reason": "stop", "message": {"content": "1_full_compliance"}},
+            ],
+        }
+        prompt = compile('"Original taxonomy. " + QUESTION + " " + RESPONSE', "<test>", "eval")
+        with (
+            patch.object(bench, "generations", return_value=rows),
+            patch.object(bench, "api_settings", return_value={"model": "gpt-4o-mini", "max_output_tokens": 128}),
+            patch.object(bench, "official_xstest_prompt", return_value=(prompt, "official-hash")),
+            patch.object(bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {})),
+            patch.object(bench, "request_judgment", return_value=(response, "1_full_compliance", 128)) as request,
+            patch.object(bench, "append_jsonl") as append,
+        ):
+            bench.judge_api({"seed": 42}, SimpleNamespace(judge_model=None), "xstest")
+        sent_prompt = request.call_args.args[2]
+        assert sent_prompt.startswith("Original taxonomy. test question test response")
+        assert sent_prompt.endswith(bench.XSTEST_OUTPUT_INSTRUCTION)
+        assert append.call_args.args[1]["finish_reason"] == "stop"
+        assert append.call_args.args[1]["max_output_tokens"] == 128
 
     def test_api_uses_inline_key_and_checks_models_list(self):
         settings = {
