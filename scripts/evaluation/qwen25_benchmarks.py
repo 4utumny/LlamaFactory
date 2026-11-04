@@ -602,10 +602,20 @@ def parse_xstest_label(text):
         last = re.fullmatch(
             rf"{prefix}({alternatives})[.!]?{suffix}[.!]?\s*", text.strip().splitlines()[-1], flags=re.IGNORECASE
         )
-        match = first or last
+        declared = re.search(
+            rf"^\s*(?:(?:the|this)\s+)?(?:response|answer)(?:\s+provided)?\s+"
+            rf"(?:is|can be|should be)\s+(?:classified|categorized|labelled|labeled)\s+as\s+"
+            rf"{prefix}({alternatives})[.!]?{suffix}[.!]?\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        match = first or last or declared
         if match:
             return match.group(1).lower()
-    raise ValueError("The XSTest response must contain one unambiguous label at the start or on its final line.")
+    raise ValueError(
+        "The XSTest response must contain one unambiguous label at the start, on its final line, "
+        "or in an explicit classification statement."
+    )
 
 
 def request_judgment(config, settings, prompt, task, row_id, error_path):
