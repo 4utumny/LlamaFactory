@@ -32,7 +32,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 # 直接在此填写 ChatAnywhere 密钥，或运行本脚本的 configure-api-key 子命令。
-API_KEY = ""
+API_KEY = "sk-eUdWcF11rcKcCx2KLeNFj1Ec0m9GFFtYvTknALBVQzVlq8wi"
 HB_REVISION = "8e1604d1171fe8a48d8febecd22f600e462bdcdd"
 CLS_REVISION = "bda705349d1144fa618770bea64d99ce54e3835b"
 TLDR_URL = "https://openaipublic.blob.core.windows.net/summarize-from-feedback/datasets/tldr_3_filtered/test.jsonl"
