@@ -127,6 +127,8 @@ cat "$OUT/metrics.json"
 
 ## 输出与续跑
 
+- HTTP 525 等中转错误、429、常见 5xx 和连接/读取超时会自动重试，每条请求最多尝试 12 次（包含首次）。等待时间依次为 5、10、20、40、60、60……秒，最长单次等待 60 秒。重试不改变裁判提示词、模型或输出预算；401 等认证错误立即报错。超过次数仍失败则退出，已保存判定保留。
+- YAML 的 `api_retry_max_attempts`、`api_retry_initial_delay_seconds`、`api_retry_max_delay_seconds` 可调整重试次数和等待时间。终端会打印 HTTP 状态、下一次尝试编号及等待秒数，不打印密钥。
 - API 返回 `finish_reason=length` 时，不采纳截断结果，并在有限重试内将该题输出预算翻倍，最多尝试三次；`content_filter` 或明确拒绝立即报错，不反复重试，也不计入任何分类。每次失败记录结束原因、请求上限和原始响应，成功记录实际使用上限。
 - 裁判返回解释时，只接受开头或最后一行的明确分类标签，保留完整原始文本；出现多个类别或仅在解释中提及标签则报错，不猜测类别。这只影响返回值解析，不改变发送给裁判的官方提示词。
 - `*.generations.jsonl` 保存原题、生成和是否触及长度上限。参考摘要不会进入 Qwen 生成提示词。
@@ -136,6 +138,23 @@ cat "$OUT/metrics.json"
 - `metrics.json` 的百分数为 0–100。`positive` 是分子，`expected` 是预期题数，`completed` 是完成题数。只有 `complete=true`、`missing=0` 时，`final_percent` 才是完整结果；`percent_among_completed` 用于查看进度。
 
 同一配置和输出目录可重复原命令续跑。更改模型、生成参数、数据或裁判版本时使用新输出目录。API_KEY 修改不触发源码指纹变化。JSONL 如出现损坏行会报错，不自动丢弃记录。
+
+## 525 自动重试更新后的续跑
+
+本次只修改 HTTP 重试及其续跑兼容逻辑，生成、提示词、标签解析和计分逻辑保持不变。YAML 的 `resume_compatible_script_sha256` 固定记录经过验证的旧源码指纹到本次新指纹的映射。只有来源指纹成对匹配，且输入、模型、提示词等阶段签名全部一致时，程序才会自动续跑；其他源码或评估参数变化仍报错。
+
+首次续跑会保留旧 `.meta.json` 的备份，再更新来源指纹；不会删除、覆盖或重新判定已有 JSONL 记录。无须清空输出目录。停止旧进程后，由用户通过 GitHub 同步本次 Python、YAML 等改动，然后执行：
+
+```bash
+cd /home/ubuntu/hmq/LlamaFactory
+source /home/ubuntu/hmq/qwen25_dpo_runtime/venv/bin/activate
+set -o pipefail
+python -u scripts/evaluation/qwen25_benchmarks.py \
+    --output-dir outputs/evaluation/qwen25_baseline \
+    judge-sff 2>&1 | tee -a outputs/evaluation/qwen25_baseline/sff_judge.log
+```
+
+保持使用原来的 API_KEY 和输出目录。重试只能等待中转恢复，不能修复服务方持续存在的源站 SSL 配置故障。
 
 ## 恢复官方提示词后的运行步骤
 

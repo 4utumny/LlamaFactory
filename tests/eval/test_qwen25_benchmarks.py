@@ -15,10 +15,13 @@
 import csv
 import importlib.util
 import io
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
+
+import requests
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -36,7 +39,155 @@ def csv_text(rows):
     return stream.getvalue()
 
 
+def api_response(status, payload=None):
+    response = requests.Response()
+    response.status_code = status
+    response.url = "https://api.chatanywhere.tech/v1/chat/completions"
+    response._content = json.dumps(payload or {}).encode()
+    response._content_consumed = True
+    response.encoding = "utf-8"
+    return response
+
+
+API_SETTINGS = {
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.chatanywhere.tech/v1",
+    "max_tokens_parameter": "max_tokens",
+    "max_output_tokens": 256,
+}
+
+
 class BenchmarkTests(unittest.TestCase):
+    def test_http_525_retries_with_exponential_backoff_and_cap(self):
+        config = {
+            "api_timeout_seconds": 180,
+            "api_retry_max_attempts": 5,
+            "api_retry_initial_delay_seconds": 5,
+            "api_retry_max_delay_seconds": 12,
+        }
+        responses = [api_response(525) for _ in range(4)] + [api_response(200, {"ok": True})]
+        with (
+            patch.object(bench, "API_KEY", "unit-test-only-key"),
+            patch("requests.request", side_effect=responses) as request,
+            patch.object(bench.time, "sleep") as sleep,
+        ):
+            result = bench.api_request(config, API_SETTINGS, "test prompt")
+        assert result == {"ok": True}
+        assert request.call_count == 5
+        assert sleep.call_args_list == [call(5), call(10), call(12), call(12)]
+        payloads = [entry.kwargs["json"] for entry in request.call_args_list]
+        assert all(payload == payloads[0] for payload in payloads)
+
+    def test_http_525_retry_limit_preserves_original_error(self):
+        config = {"api_timeout_seconds": 180, "api_retry_max_attempts": 3}
+        with (
+            patch.object(bench, "API_KEY", "unit-test-only-key"),
+            patch("requests.request", side_effect=[api_response(525) for _ in range(3)]) as request,
+            patch.object(bench.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(requests.HTTPError, "525"):
+                bench.api_request(config, API_SETTINGS, "test prompt")
+        assert request.call_count == 3
+        assert sleep.call_args_list == [call(5), call(10)]
+
+    def test_network_timeouts_and_connection_errors_are_retried(self):
+        responses = [
+            requests.Timeout("test timeout"),
+            requests.ConnectionError("test reset"),
+            api_response(200, {"ok": True}),
+        ]
+        with (
+            patch.object(bench, "API_KEY", "unit-test-only-key"),
+            patch("requests.request", side_effect=responses) as request,
+            patch.object(bench.time, "sleep") as sleep,
+        ):
+            assert bench.api_request({"api_timeout_seconds": 180}, API_SETTINGS, "test prompt") == {"ok": True}
+        assert request.call_count == 3
+        assert sleep.call_args_list == [call(5), call(10)]
+
+    def test_authentication_errors_do_not_retry(self):
+        with (
+            patch.object(bench, "API_KEY", "unit-test-only-key"),
+            patch("requests.request", return_value=api_response(401)) as request,
+            patch.object(bench.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(requests.HTTPError):
+                bench.api_request({"api_timeout_seconds": 180}, API_SETTINGS, "test prompt")
+        assert request.call_count == 1
+        sleep.assert_not_called()
+
+    def test_existing_rate_limit_and_server_error_retries_are_preserved(self):
+        for status in [429, 500, 502, 503, 504]:
+            with (
+                self.subTest(status=status),
+                patch.object(bench, "API_KEY", "unit-test-only-key"),
+                patch(
+                    "requests.request", side_effect=[api_response(status), api_response(200, {"ok": True})]
+                ) as request,
+                patch.object(bench.time, "sleep") as sleep,
+            ):
+                assert bench.api_request({"api_timeout_seconds": 180}, API_SETTINGS, "test prompt") == {"ok": True}
+                assert request.call_count == 2
+                sleep.assert_called_once_with(5)
+
+    def test_retry_settings_are_checked_before_requests(self):
+        for override in [
+            {"api_retry_max_attempts": 0},
+            {"api_retry_initial_delay_seconds": 0},
+            {"api_retry_initial_delay_seconds": 10, "api_retry_max_delay_seconds": 5},
+            {"api_retry_max_delay_seconds": float("inf")},
+        ]:
+            with (
+                self.subTest(override=override),
+                patch.object(bench, "API_KEY", "unit-test-only-key"),
+                patch("requests.request") as request,
+            ):
+                with self.assertRaises(ValueError):
+                    bench.api_request({"api_timeout_seconds": 180, **override}, API_SETTINGS, "test prompt")
+                request.assert_not_called()
+
+    def test_verified_retry_patch_resumes_all_saved_records_and_backs_up_metadata(self):
+        signature = {"input_sha256": "same-input", "prompt_sha256": "same-prompt", "api": {"model": "gpt-4o-mini"}}
+        previous = {"script_sha256": "old-source", **signature}
+        rows = [{"id": str(i), "label": "A"} for i in range(160)]
+        config = {"output_dir": "unused-output", "resume_compatible_script_sha256": {"old-source": "new-source"}}
+        with (
+            patch.object(Path, "mkdir"),
+            patch.object(Path, "exists", lambda path: path.name == "sff.judgments.meta.json"),
+            patch.object(Path, "read_text", return_value=json.dumps(previous)),
+            patch.object(bench, "script_sha", return_value="new-source"),
+            patch.object(bench, "read_jsonl", return_value=rows),
+            patch.object(bench, "write_json") as write,
+        ):
+            path, done = bench.checkpoint(config, "sff.judgments", signature)
+        assert path.name == "sff.judgments.jsonl"
+        assert len(done) == 160
+        assert done["159"] == rows[-1]
+        assert write.call_count == 2
+        assert write.call_args_list[0].args[1] == previous
+        assert "before-retry" in write.call_args_list[0].args[0].name
+        assert write.call_args_list[1].args[1] == {"script_sha256": "new-source", **signature}
+        assert all(not entry.args[0].name.endswith(".jsonl") for entry in write.call_args_list)
+
+    def test_retry_patch_cannot_resume_changed_evaluation_inputs_or_unknown_source(self):
+        previous = {"script_sha256": "old-source", "input_sha256": "same-input", "prompt_sha256": "same-prompt"}
+        for target, signature in [
+            ("new-source", {"input_sha256": "changed-input", "prompt_sha256": "same-prompt"}),
+            ("unknown-source", {"input_sha256": "same-input", "prompt_sha256": "same-prompt"}),
+        ]:
+            config = {"output_dir": "unused-output", "resume_compatible_script_sha256": {"old-source": "new-source"}}
+            with (
+                self.subTest(target=target),
+                patch.object(Path, "mkdir"),
+                patch.object(Path, "exists", return_value=True),
+                patch.object(Path, "read_text", return_value=json.dumps(previous)),
+                patch.object(bench, "script_sha", return_value=target),
+                patch.object(bench, "write_json") as write,
+            ):
+                with self.assertRaises(ValueError):
+                    bench.checkpoint(config, "sff.judgments", signature)
+                write.assert_not_called()
+
     def test_summary_reference_never_enters_generation_prompt(self):
         rows = [
             {"id": "post1", "subreddit": "test", "title": "title", "post": "post body", "summary": "REFERENCE_SECRET"}
@@ -113,7 +264,8 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_xstest_rejects_ambiguous_or_incidental_label_mentions(self):
         for text in [
-            "", "This is not 2_full_refusal.",
+            "",
+            "This is not 2_full_refusal.",
             "1_full_compliance or 3_partial_refusal",
             "The alternatives are 1_full_compliance and 2_full_refusal.\nCLASS: 1_full_compliance",
         ]:

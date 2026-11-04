@@ -31,7 +31,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-# 直接在此填写 ChatAnywhere 密钥，或运行本脚本的 configure-api-key 子命令。
+# Set the ChatAnywhere key here, or use the configure-api-key subcommand.
 API_KEY = "sk-eUdWcF11rcKcCx2KLeNFj1Ec0m9GFFtYvTknALBVQzVlq8wi"
 HB_REVISION = "8e1604d1171fe8a48d8febecd22f600e462bdcdd"
 CLS_REVISION = "bda705349d1144fa618770bea64d99ce54e3835b"
@@ -194,8 +194,28 @@ def checkpoint(config, stage, signature):
     path = out / f"{stage}.jsonl"
     metadata = {"script_sha256": script_sha(), **signature}
     if meta_path.exists():
-        if json.loads(meta_path.read_text(encoding="utf-8")) != metadata:
-            raise ValueError(f"{stage} settings, source, or inputs have changed; use a new --output-dir.")
+        previous_metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        if previous_metadata != metadata:
+            previous_source = previous_metadata.get("script_sha256")
+            permitted_source = config.get("resume_compatible_script_sha256", {}).get(previous_source)
+            previous_signature = {k: v for k, v in previous_metadata.items() if k != "script_sha256"}
+            if permitted_source != metadata["script_sha256"] or previous_signature != signature:
+                raise ValueError(f"{stage} settings, source, or inputs have changed; use a new --output-dir.")
+            # Preserve both the original provenance and all completed JSONL records.
+            previous = read_jsonl(path)
+            if len({row["id"] for row in previous}) != len(previous):
+                raise ValueError(f"Duplicate IDs found in {path}.")
+            backup = out / f"{stage}.meta.before-retry-{previous_source}.json"
+            if backup.exists():
+                if json.loads(backup.read_text(encoding="utf-8")) != previous_metadata:
+                    raise ValueError(f"The metadata backup already exists with different contents: {backup}")
+            else:
+                write_json(backup, previous_metadata)
+            write_json(meta_path, metadata)
+            print(
+                f"Resuming {stage} after a verified retry-only update; kept {len(previous)} completed records.",
+                flush=True,
+            )
     elif path.exists():
         raise ValueError(f"Cannot resume {path} without its metadata.")
     else:
@@ -500,7 +520,14 @@ def api_request(config, settings, prompt=None):
         "temperature": 0,
         settings["max_tokens_parameter"]: settings["max_output_tokens"],
     }
-    for attempt in range(4):
+    max_attempts = int(config.get("api_retry_max_attempts", 12))
+    initial_delay = float(config.get("api_retry_initial_delay_seconds", 5))
+    max_delay = float(config.get("api_retry_max_delay_seconds", 60))
+    if max_attempts < 1 or not 0 < initial_delay <= max_delay < float("inf"):
+        raise ValueError("Retry attempts must be positive; delays must be finite, positive, and initial <= maximum.")
+    retryable_statuses = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530)
+    delay = initial_delay
+    for attempt in range(1, max_attempts + 1):
         try:
             response = requests.request(
                 "POST" if prompt is not None else "GET",
@@ -509,24 +536,34 @@ def api_request(config, settings, prompt=None):
                 json=payload if prompt is not None else None,
                 timeout=(20, config["api_timeout_seconds"]),
             )
-            if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                time.sleep(2 ** (attempt + 1))
-                continue
-            response.raise_for_status()
-            result = response.json()
-            if prompt is None:
-                models = result.get("data")
-                if not isinstance(models, list):
-                    raise ValueError("The relay /models response has an unexpected format.")
-                match = next((model for model in models if model.get("id") == settings["model"]), None)
-                if match is None:
-                    raise ValueError(f"The relay does not list {settings['model']}; no substitute model was selected.")
-                return match
-            return result
-        except (requests.ConnectionError, requests.Timeout):
-            if attempt == 3:
+        except (requests.ConnectionError, requests.Timeout) as error:
+            if attempt == max_attempts:
                 raise
-            time.sleep(2 ** (attempt + 1))
+            reason = type(error).__name__
+        else:
+            if response.status_code not in retryable_statuses:
+                response.raise_for_status()
+                result = response.json()
+                if prompt is None:
+                    models = result.get("data")
+                    if not isinstance(models, list):
+                        raise ValueError("The relay /models response has an unexpected format.")
+                    match = next((model for model in models if model.get("id") == settings["model"]), None)
+                    if match is None:
+                        raise ValueError(
+                            f"The relay does not list {settings['model']}; no substitute model was selected."
+                        )
+                    return match
+                return result
+            try:
+                if attempt == max_attempts:
+                    response.raise_for_status()
+                reason = f"HTTP {response.status_code}"
+            finally:
+                response.close()
+        print(f"API request failed ({reason}); retry {attempt + 1}/{max_attempts} in {delay:g} seconds.", flush=True)
+        time.sleep(delay)
+        delay = min(delay * 2, max_delay)
     raise RuntimeError("API retries exhausted.")
 
 
