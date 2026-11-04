@@ -596,26 +596,12 @@ def parse_xstest_label(text):
     alternatives = "(?:" + "|".join(re.escape(label) for label in LABELS) + ")"
     mentioned = {label.lower() for label in re.findall(rf"\b{alternatives}\b", text, flags=re.IGNORECASE)}
     if len(mentioned) == 1:
-        prefix = r"\s*(?:(?:CLASS|Classification|Label)\s*:\s*)?(?:\*\*|[`\"'])?"
-        suffix = r"(?:\*\*|[`\"'])?"
-        first = re.match(rf"^{prefix}({alternatives}){suffix}(?=$|[\s.,:;])", text, flags=re.IGNORECASE)
-        last = re.fullmatch(
-            rf"{prefix}({alternatives})[.!]?{suffix}[.!]?\s*", text.strip().splitlines()[-1], flags=re.IGNORECASE
-        )
-        declared = re.search(
-            rf"^\s*(?:(?:the|this)\s+)?(?:response|answer)(?:\s+provided)?\s+"
-            rf"(?:is|can be|should be)\s+(?:classified|categorized|labelled|labeled)\s+as\s+"
-            rf"{prefix}({alternatives})[.!]?{suffix}[.!]?\s*$",
-            text,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        match = first or last or declared
-        if match:
-            return match.group(1).lower()
-    raise ValueError(
-        "The XSTest response must contain one unambiguous label at the start, on its final line, "
-        "or in an explicit classification statement."
-    )
+        return mentioned.pop()
+    raise ValueError("The XSTest response must contain exactly one distinct standard label; none or multiple were found.")
+
+
+class JudgeResponseError(ValueError):
+    """The API judge replied but did not provide a usable classification."""
 
 
 def request_judgment(config, settings, prompt, task, row_id, error_path):
@@ -653,7 +639,7 @@ def request_judgment(config, settings, prompt, task, row_id, error_path):
                 },
             )
             if filtered or reason not in ("stop", "length") or attempt == 2:
-                raise ValueError(f"Judge failed for {task} row {row_id}: {error}") from error
+                raise JudgeResponseError(f"Judge failed for {task} row {row_id}: {error}") from error
             if reason == "length":
                 request_settings["max_output_tokens"] *= 2
             print(
@@ -682,6 +668,14 @@ def judge_api(config, args, task):
             "seed": config["seed"],
         },
     )
+    pending_path = path.with_name(f"{stage}.pending.jsonl")
+    pending = {row["id"]: {"id": row["id"], "status": "not_attempted"} for row in rows if row["id"] not in done}
+
+    def save_pending():
+        if task == "xstest":
+            write_jsonl(pending_path, [pending[row["id"]] for row in rows if row["id"] in pending])
+
+    save_pending()
     for index, row in enumerate(rows):
         if row["id"] in done:
             continue
@@ -695,9 +689,17 @@ def judge_api(config, args, task):
             prompt = eval(
                 prompt_code, {"__builtins__": {}}, {"QUESTION": row["prompt"], "RESPONSE": row["completion"]}
             )
-        response, label, token_limit = request_judgment(
-            config, settings, prompt, task, row["id"], path.parent / "judge_errors.jsonl"
-        )
+        try:
+            response, label, token_limit = request_judgment(
+                config, settings, prompt, task, row["id"], path.parent / "judge_errors.jsonl"
+            )
+        except JudgeResponseError as error:
+            if task != "xstest":
+                raise
+            pending[row["id"]] = {"id": row["id"], "status": "needs_review", "error": str(error)}
+            save_pending()
+            print(f"xstest judge: {len(done)}/{len(rows)}; row {row['id']} pending: {error}", flush=True)
+            continue
         choice = response["choices"][0]
         judgment = {
             "id": row["id"],
@@ -712,7 +714,15 @@ def judge_api(config, args, task):
         if task == "sff":
             judgment.update(model_slot=model_slot, win=label == model_slot)
         append_jsonl(path, judgment)
-        print(f"{task} judge: {index + 1}/{len(rows)}", flush=True)
+        done[row["id"]] = judgment
+        pending.pop(row["id"], None)
+        save_pending()
+        completed = len(done) if task == "xstest" else index + 1
+        print(f"{task} judge: {completed}/{len(rows)}", flush=True)
+    if task == "xstest":
+        print(f"XSTest judging finished: {len(done)}/{len(rows)} completed; {len(pending)} pending.", flush=True)
+        if pending:
+            print(f"Review {pending_path} and judge_errors.jsonl; rerun judge-xstest to retry pending rows.")
 
 
 def judge_strmatch(config):

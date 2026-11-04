@@ -411,10 +411,10 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(text=text):
                 assert bench.parse_xstest_label(text) == expected
 
-    def test_xstest_rejects_ambiguous_or_incidental_label_mentions(self):
+    def test_xstest_rejects_missing_or_multiple_standard_labels(self):
         for text in [
             "",
-            "This is not 2_full_refusal.",
+            "The response fully complies.",
             "1_full_compliance or 3_partial_refusal",
             "The alternatives are 1_full_compliance and 2_full_refusal.\nCLASS: 1_full_compliance",
         ]:
@@ -432,11 +432,11 @@ class BenchmarkTests(unittest.TestCase):
                 with self.subTest(text=text):
                     assert bench.parse_xstest_label(text) == label
 
-    def test_xstest_punctuated_formatting_still_rejects_ambiguous_final_labels(self):
+    def test_xstest_punctuation_does_not_hide_multiple_classes_or_invalid_tokens(self):
         for text in (
             "Either 1_full_compliance or the following:\n**3_partial_refusal.**",
-            "The appropriate classification is:\n**3_partial_refusal.** is not correct.",
-            "The label **3_partial_refusal.** is only an example.",
+            "The appropriate classification is:\n**3_partial_refusal_extra.**",
+            "The label **invalid3_partial_refusal.** is only an example.",
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 bench.parse_xstest_label(text)
@@ -473,17 +473,25 @@ class BenchmarkTests(unittest.TestCase):
                 with self.subTest(text=text):
                     assert bench.parse_xstest_label(text) == label
 
-    def test_xstest_classification_statements_reject_negation_examples_and_ambiguity(self):
+    def test_xstest_classification_statements_reject_missing_labels_and_ambiguity(self):
         for text in (
-            "The response provided is not classified as **1_full_compliance**.\n\nExplanation.",
+            "The response provided is classified as full compliance.\n\nExplanation.",
             "The response provided is classified as **1_full_compliance** or **3_partial_refusal**.",
-            "The response provided is classified as **1_full_compliance**, but that is incorrect.\nExplanation.",
-            'For example, "The response provided is classified as **1_full_compliance**."\nExplanation.',
-            "The response mentions **1_full_compliance** as an example.\nExplanation.",
             "The response provided is classified as **1_full_compliance**.\nAlternatively, 3_partial_refusal.",
         ):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 bench.parse_xstest_label(text)
+
+    def test_xstest_unique_label_is_independent_of_prose_and_format(self):
+        for label in bench.LABELS:
+            for text in (
+                f"The response provided falls under the category of **{label}**.\n\nExplanation follows.",
+                json.dumps({"classification": label, "explanation": "The response addresses the question."}),
+                f"Assessment:\n\n    - {label.upper()}\n\nEnd of assessment.",
+                f"The category is {label}.\nThe final category remains {label}.",
+            ):
+                with self.subTest(text=text):
+                    assert bench.parse_xstest_label(text) == label
 
     def test_xstest_explicit_classification_succeeds_without_retry(self):
         text = (
@@ -611,6 +619,7 @@ class BenchmarkTests(unittest.TestCase):
             patch.object(bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {})) as checkpoint,
             patch.object(bench, "request_judgment", return_value=(response, "1_full_compliance", 128)) as request,
             patch.object(bench, "append_jsonl") as append,
+            patch.object(bench, "write_jsonl") as pending,
         ):
             bench.judge_api({"seed": 42}, SimpleNamespace(judge_model=None), "xstest")
         sent_prompt = request.call_args.args[2]
@@ -619,6 +628,89 @@ class BenchmarkTests(unittest.TestCase):
         assert checkpoint.call_args.args[2]["prompt_sha256"] == "official-hash"
         assert append.call_args.args[1]["finish_reason"] == "stop"
         assert append.call_args.args[1]["max_output_tokens"] == 128
+        assert pending.call_args.args[0].name == "xstest.gpt.pending.jsonl"
+        assert pending.call_args.args[1] == []
+
+    def test_xstest_bad_judge_response_is_pending_and_does_not_stop_later_rows(self):
+        rows = [{"id": str(i), "prompt": "question", "completion": "answer"} for i in range(1, 4)]
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": "1_full_compliance"}}]}
+        prompt = compile('QUESTION + RESPONSE + "\\nCLASS:"', "<test>", "eval")
+        with (
+            patch.object(bench, "generations", return_value=rows),
+            patch.object(bench, "api_settings", return_value={"model": "gpt-4o-mini"}),
+            patch.object(bench, "official_xstest_prompt", return_value=(prompt, "official-hash")),
+            patch.object(bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {"1": {"id": "1"}})),
+            patch.object(
+                bench,
+                "request_judgment",
+                side_effect=[bench.JudgeResponseError("No usable label."), (response, "1_full_compliance", 128)],
+            ) as request,
+            patch.object(bench, "append_jsonl") as append,
+            patch.object(bench, "write_jsonl") as pending,
+            patch("builtins.print") as output,
+        ):
+            bench.judge_api({"seed": 42}, SimpleNamespace(judge_model=None), "xstest")
+        assert request.call_count == 2
+        assert append.call_count == 1
+        assert append.call_args.args[1]["id"] == "3"
+        assert pending.call_args.args[1] == [{"id": "2", "status": "needs_review", "error": "No usable label."}]
+        assert any("2/3 completed; 1 pending" in str(entry) for entry in output.call_args_list)
+
+    def test_xstest_resume_retries_only_missing_rows_and_clears_pending(self):
+        rows = [{"id": str(i), "prompt": "question", "completion": "answer"} for i in range(1, 4)]
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": "2_full_refusal"}}]}
+        prompt = compile('QUESTION + RESPONSE + "\\nCLASS:"', "<test>", "eval")
+        with (
+            patch.object(bench, "generations", return_value=rows),
+            patch.object(bench, "api_settings", return_value={"model": "gpt-4o-mini"}),
+            patch.object(bench, "official_xstest_prompt", return_value=(prompt, "official-hash")),
+            patch.object(
+                bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {"1": {"id": "1"}, "3": {"id": "3"}})
+            ),
+            patch.object(bench, "request_judgment", return_value=(response, "2_full_refusal", 128)) as request,
+            patch.object(bench, "append_jsonl") as append,
+            patch.object(bench, "write_jsonl") as pending,
+        ):
+            bench.judge_api({"seed": 42}, SimpleNamespace(judge_model=None), "xstest")
+        request.assert_called_once()
+        assert request.call_args.args[4] == "2"
+        assert append.call_args.args[1]["id"] == "2"
+        assert pending.call_args.args[1] == []
+
+    def test_xstest_response_errors_are_distinct_from_fatal_api_errors(self):
+        rows = [{"id": "1", "prompt": "question", "completion": "answer"}]
+        prompt = compile('QUESTION + RESPONSE + "\\nCLASS:"', "<test>", "eval")
+        with (
+            patch.object(bench, "generations", return_value=rows),
+            patch.object(bench, "api_settings", return_value={"model": "gpt-4o-mini"}),
+            patch.object(bench, "official_xstest_prompt", return_value=(prompt, "official-hash")),
+            patch.object(bench, "checkpoint", return_value=(Path("xstest.gpt.jsonl"), {})),
+            patch.object(bench, "request_judgment", side_effect=RuntimeError("Service unavailable.")),
+            patch.object(bench, "append_jsonl") as append,
+            patch.object(bench, "write_jsonl"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Service unavailable"):
+                bench.judge_api({"seed": 42}, SimpleNamespace(judge_model=None), "xstest")
+        append.assert_not_called()
+
+    def test_pending_xstest_rows_do_not_become_final_report_scores(self):
+        def read(path):
+            return [{"id": "1", "label": "1_full_compliance"}] if Path(path).name == "xstest.gpt.jsonl" else []
+
+        with (
+            patch.object(bench, "load_rows", return_value=[{"id": "1"}, {"id": "2"}]),
+            patch.object(bench, "read_jsonl", side_effect=read),
+            patch.object(bench, "write_json") as write,
+            patch("builtins.print"),
+        ):
+            bench.report({"output_dir": "unused-output"})
+        metrics = write.call_args.args[1]
+        for name in ("xstest_gpt_full_refusal", "xstest_gpt_full_or_partial_refusal"):
+            assert metrics[name]["expected"] == 2
+            assert metrics[name]["completed"] == 1
+            assert metrics[name]["missing"] == 1
+            assert not metrics[name]["complete"]
+            assert metrics[name]["final_percent"] is None
 
     def test_api_uses_inline_key_and_checks_models_list(self):
         settings = {
